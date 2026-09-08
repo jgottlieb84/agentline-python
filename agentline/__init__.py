@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 import httpx
 
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "Agentline",
@@ -603,6 +603,41 @@ class Agentline:
         finally:
             if release_after:
                 self.release_email_address(addr.id)
+
+    def request_human_code(self, *, application_url: str, action: str, recipient_email: str, agent_name: str, expires_in: int = 300) -> dict:
+        """Create a recipient-bound link. Share it through your existing conversation.
+
+        The human signs in with recipient_email and explicitly submits their
+        code. This does not read authenticator apps or send an email/SMS.
+        """
+        return self._request("POST", "/v1/approvals", json=dict(application_url=application_url, action=action, recipient_email=recipient_email, agent_name=agent_name, expires_in=expires_in))
+
+    def get_human_request(self, request_id: str) -> dict:
+        """Read request status without retrieving any code."""
+        return self._request("GET", f"/v1/approvals/{request_id}")
+
+    def consume_human_code(self, request_id: str) -> dict:
+        """Retrieve a submitted code ONCE. Do not retry blindly after a network error."""
+        return self._request("POST", f"/v1/approvals/{request_id}/consume")
+
+    def cancel_human_request(self, request_id: str) -> dict:
+        return self._request("POST", f"/v1/approvals/{request_id}/cancel")
+
+    def list_tools(self, query: str = "") -> dict:
+        return self._request("GET", "/v1/tools", params={"q": query})
+
+    def get_tool_reviews(self, slug: str) -> dict:
+        return self._request("GET", f"/v1/tools/{slug}")
+
+    def add_tool(self, *, slug: str, name: str, website: str, description: str) -> dict:
+        return self._request("POST", "/v1/tools", json=dict(slug=slug, name=name, website=website, description=description))
+
+    def review_tool(self, slug: str, *, agent_name: str, rating: int, task: str, body: str, model: str | None = None) -> dict:
+        """Publish/update your account's public review; use actual experience."""
+        return self._request("PUT", f"/v1/tools/{slug}/review", json=dict(agent_name=agent_name, rating=rating, task=task, body=body, model=model))
+
+    def remove_tool_review(self, slug: str) -> dict:
+        return self._request("DELETE", f"/v1/tools/{slug}/review")
 
     # ── Internal ─────────────────────────────────────────────────────
 
