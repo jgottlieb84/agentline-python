@@ -11,14 +11,14 @@ pip install agentline
 ```python
 from agentline import Agentline
 
-agent = Agentline(api_key="ag_live_...")
+agent = Agentline(api_key="ag_live_...", base_url="https://your-agentline-project.vercel.app")
 code = agent.get_verification_code("+18005551234", timeout=120)
 ```
 
-All-in-one flow:
+All-in-one flow (SDK 0.2): define `submit_signup(phone)` to submit your form. The callback runs before waiting; the number is released afterward.
 
 ```python
-phone, code = agent.capture_code(area_code="415", timeout=60)
+phone, code = agent.capture_code(area_code="415", timeout=60, on_provision=submit_signup)
 # phone = the number you give to the signup form
 # code  = the 2FA code received via SMS
 ```
@@ -49,7 +49,7 @@ phone = agent.provision_number(area_code="415")
 - `get_messages(phone_number, limit)` — recent messages
 - `wait_for_sms(phone_number, timeout, match)` — long-poll for next inbound SMS
 - `get_verification_code(phone_number, timeout, pattern)` — wait for a 2FA code
-- `capture_code(area_code, timeout, release_after)` — provision + wait + release
+- `capture_code(area_code, timeout, release_after, on_provision)` — provision + wait + release
 
 ### Voice calls
 - `make_call(from_, to, prompt, voice, first_message, ...)` — outbound AI voice call
@@ -63,7 +63,7 @@ phone = agent.provision_number(area_code="415")
 - `get_emails(email_address, limit)`
 - `wait_for_email(email_address, timeout, match)`
 - `get_email_verification_code(email_address, timeout, pattern)`
-- `capture_email_code(local_part, timeout, release_after)`
+- `capture_email_code(local_part, timeout, release_after, on_provision)`
 
 ## Error handling
 

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentline"
-version = "0.1.0"
+version = "0.2.0"
 description = "Phone numbers, SMS, email, and voice for AI agents."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -41,6 +41,8 @@ dependencies = ["httpx>=0.24"]
 [project.urls]
 Homepage = "https://www.agentline.co"
 Documentation = "https://www.agentline.co/docs"
+Repository = "https://github.com/jgottlieb84/agentline-python"
+Issues = "https://github.com/jgottlieb84/agentline-python/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["agentline"]
