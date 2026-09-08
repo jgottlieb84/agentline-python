@@ -12,13 +12,14 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass, fields
+from typing import Any, Callable
+from datetime import datetime, timezone
 
 import httpx
 
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "Agentline",
@@ -243,7 +244,7 @@ class Agentline:
     def get_messages(self, phone_number: str, limit: int = 20) -> list[SMSMessage]:
         """Retrieve recent messages for a phone number."""
         resp = self._request("GET", f"/v1/messages/{phone_number}", params={"limit": limit})
-        return [SMSMessage(**m) for m in resp["messages"]]
+        return [self._message_from_dict(SMSMessage, m) for m in resp["messages"]]
 
     def send_sms(self, from_: str, to: str, body: str) -> dict:
         """Send an outbound SMS."""
@@ -260,6 +261,7 @@ class Agentline:
         phone_number: str,
         timeout: float = 120.0,
         match: str | None = None,
+        since: str | None = None,
     ) -> SMSMessage | None:
         """Long-poll for the next inbound SMS on *phone_number*.
 
@@ -267,24 +269,28 @@ class Agentline:
             phone_number: The provisioned number to listen on.
             timeout: Max seconds to wait.
             match: Optional regex pattern to filter messages.
+            since: ISO timestamp captured before triggering the message; avoids missing fast replies.
 
         Returns:
             The matching SMSMessage, or None on timeout.
         """
         params: dict[str, Any] = {"wait": timeout}
+        if since:
+            params["since"] = since
         if match:
             params["match"] = match
 
-        resp = self._request("GET", f"/v1/messages/{phone_number}", params=params)
+        resp = self._request("GET", f"/v1/messages/{phone_number}", params=params, timeout=timeout + 10)
         if resp.get("status") == "timeout" or resp.get("message") is None:
             return None
-        return SMSMessage(**resp["message"])
+        return self._message_from_dict(SMSMessage, resp["message"])
 
     def get_verification_code(
         self,
         phone_number: str,
         timeout: float = 120.0,
         pattern: str = r"\d{4,8}",
+        since: str | None = None,
     ) -> str | None:
         """Wait for and return a verification code. The killer one-liner.
 
@@ -296,13 +302,13 @@ class Agentline:
         Returns:
             The extracted code string, or None on timeout.
         """
-        msg = self.wait_for_sms(phone_number, timeout=timeout, match=pattern)
-        if msg and msg.extracted_code:
+        msg = self.wait_for_sms(phone_number, timeout=timeout, match=pattern, since=since)
+        if msg and msg.extracted_code and re.fullmatch(pattern, msg.extracted_code):
             return msg.extracted_code
         if msg and msg.body:
             # Fallback: try to extract from body client-side
             m = re.search(pattern, msg.body)
-            return m.group(0) if m else msg.body
+            return m.group(0) if m else None
         return None
 
     # ── Convenience: provision + capture + release ───────────────────
@@ -312,21 +318,26 @@ class Agentline:
         area_code: str | None = None,
         timeout: float = 120.0,
         release_after: bool = True,
+        on_provision: Callable[[str], None] | None = None,
     ) -> tuple[str, str | None]:
-        """All-in-one: provision a number, wait for a code, optionally release.
+        """Provision, call on_provision(phone) to trigger verification, wait, release.
 
         Returns:
             (phone_number, code) tuple.
 
         Usage::
 
-            phone, code = agent.capture_code(area_code="415", timeout=60)
-            # Use `phone` as the phone number for signup
+            phone, code = agent.capture_code(area_code="415", timeout=60, on_provision=submit_signup)
+            # submit_signup(phone) triggers the verification before waiting
             # `code` is the 2FA code received via SMS
         """
+        if on_provision is None:
+            raise ValueError("Pass on_provision to trigger verification, or use provision_number() then wait_for_sms()")
         number = self.provision_number(area_code=area_code)
         try:
-            code = self.get_verification_code(number.phone_number, timeout=timeout)
+            since = datetime.now(timezone.utc).isoformat()
+            on_provision(number.phone_number)
+            code = self.get_verification_code(number.phone_number, timeout=timeout, since=since)
             return number.phone_number, code
         finally:
             if release_after:
@@ -345,6 +356,7 @@ class Agentline:
         max_duration_seconds: int = 300,
         wait: bool = True,
         poll_interval: float = 2.0,
+        wait_timeout: float | None = None,
     ) -> "CallResult":
         """Place an outbound AI voice call.
 
@@ -358,6 +370,7 @@ class Agentline:
             max_duration_seconds: Max call duration.
             wait: If True, blocks until call completes and returns transcript.
             poll_interval: Seconds between status polls when wait=True.
+            wait_timeout: Client deadline; defaults to max call duration plus 60 seconds.
 
         Returns:
             CallResult with status, transcript, and summary.
@@ -372,6 +385,8 @@ class Agentline:
             )
             print(result.transcript)
         """
+        if wait and (poll_interval <= 0 or (wait_timeout is not None and wait_timeout <= 0)):
+            raise ValueError("poll_interval and wait_timeout must be positive")
         resp = self._request("POST", "/v1/calls", json={
             "from_number": from_,
             "to_number": to,
@@ -393,12 +408,18 @@ class Agentline:
             )
 
         # Poll until call completes
-        import time as _time
-        terminal_states = {"completed", "failed", "no_answer", "busy"}
+        terminal_states = {"completed", "failed", "no_answer", "busy", "canceled", "cancelled"}
+        deadline = time.monotonic() + (wait_timeout if wait_timeout is not None else max_duration_seconds + 60)
 
         while True:
-            _time.sleep(poll_interval)
-            status = self._request("GET", f"/v1/calls/{call_id}")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AgentlineError(f"Timed out waiting for call {call_id}; use get_call() to check its status")
+            time.sleep(min(poll_interval, remaining))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AgentlineError(f"Timed out waiting for call {call_id}; use get_call() to check its status")
+            status = self._request("GET", f"/v1/calls/{call_id}", timeout=remaining)
 
             if status["status"] in terminal_states:
                 return CallResult(
@@ -497,13 +518,14 @@ class Agentline:
     def get_emails(self, email_address: str, limit: int = 20) -> list[EmailMessageResult]:
         """Retrieve recent emails for an address."""
         resp = self._request("GET", f"/v1/emails/{email_address}", params={"limit": limit})
-        return [EmailMessageResult(**m) for m in resp["messages"]]
+        return [self._message_from_dict(EmailMessageResult, m) for m in resp["messages"]]
 
     def wait_for_email(
         self,
         email_address: str,
         timeout: float = 120.0,
         match: str | None = None,
+        since: str | None = None,
     ) -> EmailMessageResult | None:
         """Long-poll for the next inbound email.
 
@@ -511,24 +533,28 @@ class Agentline:
             email_address: The provisioned address to listen on.
             timeout: Max seconds to wait.
             match: Optional regex pattern to filter.
+            since: ISO timestamp captured before triggering the message; avoids missing fast replies.
 
         Returns:
             The matching EmailMessageResult, or None on timeout.
         """
         params: dict[str, Any] = {"wait": timeout}
+        if since:
+            params["since"] = since
         if match:
             params["match"] = match
 
-        resp = self._request("GET", f"/v1/emails/{email_address}", params=params)
+        resp = self._request("GET", f"/v1/emails/{email_address}", params=params, timeout=timeout + 10)
         if resp.get("status") == "timeout" or resp.get("message") is None:
             return None
-        return EmailMessageResult(**resp["message"])
+        return self._message_from_dict(EmailMessageResult, resp["message"])
 
     def get_email_verification_code(
         self,
         email_address: str,
         timeout: float = 120.0,
         pattern: str = r"\d{4,8}",
+        since: str | None = None,
     ) -> str | None:
         """Wait for and return a verification code from email.
 
@@ -540,12 +566,12 @@ class Agentline:
         Returns:
             The extracted code string, or None on timeout.
         """
-        msg = self.wait_for_email(email_address, timeout=timeout, match=pattern)
-        if msg and msg.extracted_code:
+        msg = self.wait_for_email(email_address, timeout=timeout, match=pattern, since=since)
+        if msg and msg.extracted_code and re.fullmatch(pattern, msg.extracted_code):
             return msg.extracted_code
         if msg and msg.body_text:
             m = re.search(pattern, msg.body_text)
-            return m.group(0) if m else msg.body_text
+            return m.group(0) if m else None
         return None
 
     def capture_email_code(
@@ -553,27 +579,38 @@ class Agentline:
         local_part: str | None = None,
         timeout: float = 120.0,
         release_after: bool = True,
+        on_provision: Callable[[str], None] | None = None,
     ) -> tuple[str, str | None]:
-        """All-in-one: create email address, wait for a code, optionally release.
+        """Provision, call on_provision(email) to trigger verification, wait, release.
 
         Returns:
             (email_address, code) tuple.
 
         Usage::
 
-            email, code = agent.capture_email_code(timeout=60)
-            # Use `email` for signup
+            email, code = agent.capture_email_code(timeout=60, on_provision=submit_signup)
+            # submit_signup(email) triggers the verification before waiting
             # `code` is the verification code received via email
         """
+        if on_provision is None:
+            raise ValueError("Pass on_provision to trigger verification, or use create_email_address() then wait_for_email()")
         addr = self.create_email_address(local_part=local_part)
         try:
-            code = self.get_email_verification_code(addr.email_address, timeout=timeout)
+            since = datetime.now(timezone.utc).isoformat()
+            on_provision(addr.email_address)
+            code = self.get_email_verification_code(addr.email_address, timeout=timeout, since=since)
             return addr.email_address, code
         finally:
             if release_after:
                 self.release_email_address(addr.id)
 
     # ── Internal ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _message_from_dict(message_type, payload: dict):
+        """Accept additive API fields without weakening required-field checks."""
+        names = {item.name for item in fields(message_type)}
+        return message_type(**{key: value for key, value in payload.items() if key in names})
 
     def _request(self, method: str, path: str, **kwargs) -> dict:
         resp = self._client.request(method, path, **kwargs)
